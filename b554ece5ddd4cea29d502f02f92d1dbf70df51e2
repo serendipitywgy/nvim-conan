@@ -1,0 +1,23 @@
+lua/utils.lua
+  7d7a8652b63b4a83 94-100,109-118,120-122,124,126-128,130-135,141-142,144,146-149,152-158,163,200,203-207,209-211,217,226-235,238,242,245-246,250-254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.16",
+  "base_commit_sha": "b554ece5ddd4cea29d502f02f92d1dbf70df51e2",
+  "prompts": {
+    "7d7a8652b63b4a83": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1bd405246ffeiv60CZmQxR12SD",
+        "model": "opencode/big-pickle"
+      },
+      "human_author": "wangguangyu <wangguangyu@maker-ray.com>",
+      "messages": [],
+      "total_additions": 104,
+      "total_deletions": 62,
+      "accepted_lines": 79,
+      "overriden_lines": 0
+    }
+  }
+}
