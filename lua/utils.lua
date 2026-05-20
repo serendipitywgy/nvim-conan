@@ -74,10 +74,12 @@ function M.ensure_config(path, default_table)
 end
 
 function M.get_major_version(version)
+  if type(version) ~= "string" then return 0 end
   return tonumber(version:match("^(%d+)")) or 0
 end
 
 function M.check_version_compat(config_version, plugin_version)
+  if not config_version then return end
   local config_major = M.get_major_version(config_version)
   local plugin_major = M.get_major_version(plugin_version)
 
@@ -141,9 +143,53 @@ function M.open_floating_terminal(cmd, title, close_term, opts)
     end
   end
 
+  local function populate_quickfix(exit_code)
+    if not vim.api.nvim_buf_is_valid(buf) then return end
+    local raw_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+
+    -- 去除 ANSI 转义码，保证 errorformat 正确匹配
+    local lines = {}
+    for _, line in ipairs(raw_lines) do
+      local clean = (line:gsub("\27%[[%d;]*m", ""):gsub("\27%[[%d;]*[A-Za-z]", ""))
+      table.insert(lines, clean)
+    end
+
+    local saved_efm = vim.o.errorformat
+    vim.o.errorformat = table.concat({
+      "%f:%l:%c: %trror: %m",
+      "%f:%l:%c: %tarning: %m",
+      "%f:%l:%c: %tnfo: %m",
+      "%f:%l:%c: note: %m",
+      "%f:%l: %trror: %m",
+      "%f:%l: %tarning: %m",
+      "%-G%.%#",
+    }, ",")
+
+    vim.fn.setqflist({}, " ", { title = title or cmd, lines = lines })
+    vim.o.errorformat = saved_efm
+
+    -- 只在构建失败时打开 quickfix，且有实际错误条目
+    if exit_code ~= 0 then
+      local qf = vim.fn.getqflist()
+      local has_errors = false
+      for _, item in ipairs(qf) do
+        if item.valid == 1 then
+          has_errors = true
+          break
+        end
+      end
+      if has_errors then
+        vim.cmd("botright copen 10")
+      end
+    end
+  end
+
   local _ = vim.fn.termopen(cmd, {
+    env = { COLUMNS = "500" },
     on_exit = function(_, code, _)
       vim.schedule(function()
+        populate_quickfix(code)
+
         if type(opts.on_exit) == "function" then
           pcall(opts.on_exit, code, { win = win, buf = buf, cmd = cmd, title = title })
         end
@@ -242,79 +288,62 @@ function M.get_conan_profiles()
 end
 
 function M.pick_conan_profile(prompt, callback)
-  local pickers = require("telescope.pickers")
-  local finders = require("telescope.finders")
-  local conf = require("telescope.config").values
-  local actions = require("telescope.actions")
-  local action_state = require("telescope.actions.state")
-
   local profiles = M.get_conan_profiles()
   if #profiles == 0 then
     vim.notify("No Conan profiles found", vim.log.levels.WARN)
     return
   end
 
-  pickers.new({}, {
-    prompt_title = prompt,
-    finder = finders.new_table { results = profiles },
-    sorter = conf.generic_sorter({}),
-    attach_mappings = function(bufnr)
-      actions.select_default:replace(function()
-        actions.close(bufnr)
-        local selection = action_state.get_selected_entry()[1]
-        callback(selection)
-      end)
-      return true
+  local items = {}
+  for _, p in ipairs(profiles) do
+    items[#items + 1] = { text = p }
+  end
+
+  Snacks.picker.pick({
+    title = prompt,
+    items = items,
+    format = function(item) return { { item.text } } end,
+    confirm = function(picker, item)
+      picker:close()
+      if item then callback(item.text) end
     end,
-  }):find()
+  })
 end
 
 function M.pick_build_policy(callback)
-  local pickers = require("telescope.pickers")
-  local finders = require("telescope.finders")
-  local conf = require("telescope.config").values
-  local actions = require("telescope.actions")
-  local action_state = require("telescope.actions.state")
-
   local options = { "missing", "never", "always" }
+  local items = {}
+  for _, o in ipairs(options) do
+    items[#items + 1] = { text = o }
+  end
 
-  pickers.new({}, {
-    prompt_title = "Select Build Policy",
-    finder = finders.new_table { results = options },
-    sorter = conf.generic_sorter({}),
-    attach_mappings = function(bufnr)
-      actions.select_default:replace(function()
-        actions.close(bufnr)
-        local selection = action_state.get_selected_entry()[1]
-        callback(selection)
-      end)
-      return true
+  Snacks.picker.pick({
+    title = "Select Build Policy",
+    items = items,
+    format = function(item) return { { item.text } } end,
+    confirm = function(picker, item)
+      picker:close()
+      if item then callback(item.text) end
     end,
-  }):find()
+  })
 end
 
 function M.pick_recipe(prompt, callback)
-  local pickers = require("telescope.pickers")
-  local finders = require("telescope.finders")
-  local conf = require("telescope.config").values
-  local actions = require("telescope.actions")
-  local action_state = require("telescope.actions.state")
-
   local recipes = vim.fn.glob(vim.fn.getcwd() .. "/conanfile*.py", false, true)
+  local items = {}
+  for _, r in ipairs(recipes) do
+    items[#items + 1] = { text = r }
+  end
 
-  pickers.new({}, {
-    prompt_title = prompt,
-    finder = finders.new_table { results = recipes },
-    sorter = conf.generic_sorter({}),
-    attach_mappings = function(bufnr)
-      actions.select_default:replace(function()
-        actions.close(bufnr)
-        local selection = action_state.get_selected_entry()[1]
-        callback(selection)
-      end)
-      return true
+  Snacks.picker.pick({
+    title = prompt,
+    items = items,
+    format = function(item) return { { item.text } } end,
+    confirm = function(picker, item)
+      picker:close()
+      if item then callback(item.text) end
     end,
-  }):find()
+  })
 end
 
 function M.find_latest_compile_commands()

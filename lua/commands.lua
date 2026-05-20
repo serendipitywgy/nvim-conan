@@ -5,7 +5,7 @@
 --- This module integrates:
 --- - floating terminal runner (utils.open_floating_terminal)
 --- - lualine status via conan_status (spinner + text)
---- - Telescope UI for `conan search` results
+--- - Snacks.picker UI for `conan search` results
 ---
 --- Requirements:
 --- - `utils.open_floating_terminal(cmd, title, close_term, opts)` supports `opts.on_exit(code, ctx?)`
@@ -14,13 +14,6 @@ local M = {
   ---@private
   _search_started = false,
 }
-
-local pickers = require("telescope.pickers")
-local finders = require("telescope.finders")
-local conf = require("telescope.config").values
-local previewers = require("telescope.previewers")
-local actions = require("telescope.actions")
-local action_state = require("telescope.actions.state")
 
 local conan_status = require("conan_status")
 
@@ -31,23 +24,34 @@ local function config_path()
   return vim.fn.getcwd() .. "/.nvim-conan.json"
 end
 
+--- 配置缓存：key 为 path，value 为 { mtime, config }
+local _config_cache = {}
+
 --- Reads and decodes `.nvim-conan.json` from current working directory.
---- Returns nil on any error (missing file / invalid JSON / IO error).
+--- Caches result by file mtime — re-reads only when file changes.
 ---@return table|nil
 local function read_config()
+  local path = config_path()
+  local stat = vim.loop.fs_stat(path)
+  if not stat then return nil end
+
+  local mtime = stat.mtime.sec
+  local cached = _config_cache[path]
+  if cached and cached.mtime == mtime then
+    return cached.config
+  end
+
   local ok, config = pcall(function()
-    local file = io.open(config_path(), "r")
-    if not file then
-      return nil
-    end
+    local file = io.open(path, "r")
+    if not file then return nil end
     local content = file:read("*a")
     file:close()
     return vim.json.decode(content)
   end)
 
-  if not ok or config == nil then
-    return nil
-  end
+  if not ok or config == nil then return nil end
+
+  _config_cache[path] = { mtime = mtime, config = config }
   return config
 end
 
@@ -306,9 +310,9 @@ local function build_index(results)
   return refs, by_ref, all_remotes, remote_errors
 end
 
---- Opens Telescope picker for search results:
---- - left pane: package refs
---- - preview: remotes availability + per-remote errors
+--- Opens Snacks.picker for search results:
+--- - left pane: package refs（可模糊搜索）
+--- - preview: 该包在各 remote 的存在情况 + 错误信息
 ---@param pattern string
 ---@param results table
 local function open_search_picker(pattern, results)
@@ -337,77 +341,66 @@ local function open_search_picker(pattern, results)
     return
   end
 
-  pickers.new({}, {
-    prompt_title = ("Conan search: " .. pattern),
-    finder = finders.new_table({
-      results = refs,
-      entry_maker = function(ref)
-        local present = by_ref[ref] or {}
-        local cnt = 0
-        for _ in pairs(present) do cnt = cnt + 1 end
-        return {
-          value = ref,
-          ordinal = ref,
-          display = string.format("%-30s  (%d)", ref, cnt),
-          present = present,
-        }
-      end,
-    }),
-    sorter = conf.generic_sorter({}),
-    previewer = previewers.new_buffer_previewer({
-      define_preview = function(self, entry)
-        local lines = {}
-        table.insert(lines, ("Recipe: %s"):format(entry.value))
-        table.insert(lines, "")
+  -- 构建 snacks picker items，每个 item 携带预览内容
+  local items = {}
+  for _, ref in ipairs(refs) do
+    local present = by_ref[ref] or {}
+    local cnt = 0
+    for _ in pairs(present) do cnt = cnt + 1 end
 
-        for _, r in ipairs(all_remotes) do
-          local err = remote_errors[r]
-          if err then
-            table.insert(lines, ("  ⚠️  %s: %s"):format(r, err))
-          else
-            local ok = entry.present[r] == true
-            table.insert(lines, ("  %s  %s"):format(ok and "✅" or "—", r))
-          end
-        end
-
-        table.insert(lines, "")
-        table.insert(lines, "Actions:")
-        table.insert(lines, "  <Enter>  copy ref to clipboard")
-        table.insert(lines, "  <C-i>    insert ref at cursor")
-
-        vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
-        vim.bo[self.state.bufnr].filetype = "markdown"
-      end,
-    }),
-    layout_strategy = "horizontal",
-    layout_config = {
-      preview_width = 0.50,
-      width = 0.95,
-      height = 0.80,
-    },
-    attach_mappings = function(prompt_bufnr, map)
-      local function get_entry()
-        return action_state.get_selected_entry()
+    -- 预览面板内容
+    local preview_lines = {
+      ("Recipe: %s"):format(ref),
+      "",
+      "Remote availability:",
+    }
+    for _, r in ipairs(all_remotes) do
+      local err = remote_errors[r]
+      if err then
+        table.insert(preview_lines, ("  ⚠️  %s: %s"):format(r, err))
+      else
+        local ok = present[r] == true
+        table.insert(preview_lines, ("  %s  %s"):format(ok and "✅" or "—", r))
       end
+    end
+    table.insert(preview_lines, "")
+    table.insert(preview_lines, "Actions:")
+    table.insert(preview_lines, "  <Enter>  copy ref to clipboard")
+    table.insert(preview_lines, "  <C-i>    insert ref at cursor")
 
-      actions.select_default:replace(function()
-        local e = get_entry()
-        actions.close(prompt_bufnr)
-        if not e or not e.value then return end
-        vim.fn.setreg("+", e.value)
-        vim.notify(("Copied: %s"):format(e.value), vim.log.levels.INFO)
-      end)
+    items[#items + 1] = {
+      text = string.format("%-40s  (%d remotes)", ref, cnt),
+      ref = ref,
+      preview = { text = table.concat(preview_lines, "\n"), ft = "markdown" },
+    }
+  end
 
-      map({ "i", "n" }, "<C-i>", function()
-        local e = get_entry()
-        actions.close(prompt_bufnr)
-        if not e or not e.value then return end
-        vim.api.nvim_put({ e.value }, "c", true, true)
-      end)
-
-      return true
+  Snacks.picker.pick({
+    title = ("Conan search: %s"):format(pattern),
+    items = items,
+    format = function(item) return { { item.text } } end,
+    confirm = function(picker, item)
+      picker:close()
+      if not item then return end
+      vim.fn.setreg("+", item.ref)
+      vim.notify(("Copied: %s"):format(item.ref), vim.log.levels.INFO)
     end,
-  }):find()
+    actions = {
+      insert_ref = function(picker, item)
+        picker:close()
+        if not item then return end
+        vim.api.nvim_put({ item.ref }, "c", true, true)
+      end,
+    },
+    win = {
+      input = {
+        keys = {
+          ["<C-i>"] = { "insert_ref", mode = { "i", "n" } },
+        },
+      },
+    },
+    layout = { preview = true },
+  })
 end
 
 --- Entry point for `:Conan search <pattern> [remote]`
@@ -430,7 +423,7 @@ end
 -- Upload (status only on run)
 -- -------------------------
 
---- Opens a Telescope flow: choose remote -> choose cached ref -> run `conan upload`.
+--- Opens a Snacks.picker flow: choose remote -> choose cached ref -> run `conan upload`.
 --- Statusline spinner starts only when upload command actually runs.
 function M.upload()
   local utils = require("utils")
@@ -441,46 +434,49 @@ function M.upload()
     return
   end
 
-  pickers.new({}, {
-    prompt_title = "Select Conan Remote",
-    finder = finders.new_table { results = remotes },
-    sorter = conf.generic_sorter({}),
-    attach_mappings = function(prompt_bufnr)
-      actions.select_default:replace(function()
-        actions.close(prompt_bufnr)
-        local remote = action_state.get_selected_entry()[1]
+  local remote_items = {}
+  for _, r in ipairs(remotes) do
+    remote_items[#remote_items + 1] = { text = r }
+  end
 
-        local refs = utils.get_cached_package_refs()
-        if #refs == 0 then
-          vim.notify("No cached Conan packages found", vim.log.levels.WARN)
-          return
-        end
+  Snacks.picker.pick({
+    title = "Select Conan Remote",
+    items = remote_items,
+    format = function(item) return { { item.text } } end,
+    confirm = function(picker, item)
+      picker:close()
+      if not item then return end
+      local remote = item.text
 
-        pickers.new({}, {
-          prompt_title = "Select Package Ref",
-          finder = finders.new_table { results = refs },
-          sorter = conf.generic_sorter({}),
-          attach_mappings = function(ref_bufnr)
-            actions.select_default:replace(function()
-              actions.close(ref_bufnr)
-              local ref = action_state.get_selected_entry()[1]
+      local refs = utils.get_cached_package_refs()
+      if #refs == 0 then
+        vim.notify("No cached Conan packages found", vim.log.levels.WARN)
+        return
+      end
 
-              local cmd = string.format("conan upload %s -r=%s --confirm", ref, remote)
+      local ref_items = {}
+      for _, r in ipairs(refs) do
+        ref_items[#ref_items + 1] = { text = r }
+      end
 
-              run_terminal_with_status(
-                ("📤 Conan: upload %s → %s"):format(ref, remote),
-                cmd,
-                string.format("📦 Upload: %s → %s", ref, remote),
-                true
-              )
-            end)
-            return true
-          end,
-        }):find()
-      end)
-      return true
+      Snacks.picker.pick({
+        title = ("Select Package Ref → %s"):format(remote),
+        items = ref_items,
+        format = function(i) return { { i.text } } end,
+        confirm = function(picker2, ref_item)
+          picker2:close()
+          if not ref_item then return end
+          local cmd = string.format("conan upload %s -r=%s --confirm", ref_item.text, remote)
+          run_terminal_with_status(
+            ("📤 Conan: upload %s → %s"):format(ref_item.text, remote),
+            cmd,
+            string.format("📦 Upload: %s → %s", ref_item.text, remote),
+            true
+          )
+        end,
+      })
     end,
-  }):find()
+  })
 end
 
 return M

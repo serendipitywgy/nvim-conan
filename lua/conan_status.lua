@@ -19,7 +19,7 @@ local function in_conan_project()
 end
 
 local function redraw()
-  vim.cmd("redrawstatus")
+  vim.api.nvim_exec_autocmds("User", { pattern = "ConanStatusUpdated" })
 end
 
 function M.start(text)
