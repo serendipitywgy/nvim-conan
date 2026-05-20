@@ -91,6 +91,13 @@ function M.check_version_compat(config_version, plugin_version)
   end
 end
 
+-- 全局标记当前 conan terminal buffer，避免重复打开
+local _term_buf = nil
+
+function M.get_term_buf()
+  return _term_buf
+end
+
 function M.open_floating_terminal(cmd, title, close_term, opts)
   assert(type(cmd) == "string", "cmd must be a string")
 
@@ -99,44 +106,61 @@ function M.open_floating_terminal(cmd, title, close_term, opts)
   end
   opts = opts or {}
 
+  -- 若已有 conan terminal buffer 存在，先关闭对应窗口
+  if _term_buf and vim.api.nvim_buf_is_valid(_term_buf) then
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(win) == _term_buf then
+        vim.api.nvim_win_close(win, true)
+        break
+      end
+    end
+  end
+  _term_buf = nil
+
+  -- 记录触发 build 的原始窗口，build 结束后焦点回来
+  local origin_win = vim.api.nvim_get_current_win()
+
   local buf = vim.api.nvim_create_buf(false, true)
+  _term_buf = buf
 
-  local width = math.floor(vim.o.columns * 0.8)
-  local height = math.floor(vim.o.lines * 0.6)
-  local row = math.floor((vim.o.lines - height) / 2)
-  local col = math.floor((vim.o.columns - width) / 2)
+  -- 设置 buffer 名称（带序号避免重复）
+  local buf_name = "ConanBuild[" .. buf .. "]"
+  pcall(vim.api.nvim_buf_set_name, buf, buf_name)
 
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    row = row,
-    col = col,
-    style = "minimal",
-    border = "rounded",
-    title = title or cmd,
-    title_pos = "left",
-  })
+  -- 底部横跨全宽 split
+  local height = math.max(12, math.min(20, math.floor(vim.o.lines * 0.25)))
+  vim.cmd("botright split")
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.api.nvim_win_set_height(win, height)
 
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = "terminal"
-  vim.bo[buf].readonly = true
   vim.bo[buf].buftype = "nofile"
 
-  vim.api.nvim_create_autocmd("TermEnter", {
+  -- 防止进入 insert 模式
+  vim.api.nvim_create_autocmd({ "TermEnter", "InsertEnter" }, {
     buffer = buf,
-    callback = function()
-      vim.cmd("stopinsert")
-    end,
+    callback = function() vim.cmd("stopinsert") end,
   })
-  vim.api.nvim_create_autocmd("InsertEnter", {
+
+  -- 自动滚动：用户手动滚动后暂停，exit 时恢复滚到底
+  local user_scrolled = false
+  vim.api.nvim_create_autocmd("WinScrolled", {
     buffer = buf,
     callback = function()
-      vim.cmd("stopinsert")
+      if vim.api.nvim_win_is_valid(win) then
+        local cur = vim.api.nvim_win_get_cursor(win)[1]
+        local last = vim.api.nvim_buf_line_count(buf)
+        if cur < last - 2 then
+          user_scrolled = true
+        end
+      end
     end,
   })
 
   local function scroll_to_bottom()
+    if user_scrolled then return end
     if vim.api.nvim_win_is_valid(win) and vim.api.nvim_buf_is_valid(buf) then
       local line_count = vim.api.nvim_buf_line_count(buf)
       vim.api.nvim_win_set_cursor(win, { line_count, 0 })
@@ -173,19 +197,24 @@ function M.open_floating_terminal(cmd, title, close_term, opts)
       local qf = vim.fn.getqflist()
       local has_errors = false
       for _, item in ipairs(qf) do
-        if item.valid == 1 then
-          has_errors = true
-          break
-        end
+        if item.valid == 1 then has_errors = true; break end
       end
       if has_errors then
+        -- 先关闭终端窗口（保留 buffer 供 <leader>bl 呼出），再打开 quickfix，最后在主窗口跳转
+        if vim.api.nvim_win_is_valid(win) then
+          vim.bo[buf].bufhidden = "hide"  -- 改为 hide，关窗口时不销毁 buffer
+          vim.api.nvim_win_close(win, false)
+        end
         vim.cmd("botright copen 10")
+        -- 回到主编辑窗口执行 cfirst，避免在 quickfix 窗口中触发新 split
+        vim.cmd("wincmd p")
+        vim.cmd("cfirst")
       end
     end
   end
 
   local _ = vim.fn.termopen(cmd, {
-    env = { COLUMNS = "500" },
+    env = { COLUMNS = tostring(vim.o.columns) },
     on_exit = function(_, code, _)
       vim.schedule(function()
         populate_quickfix(code)
@@ -194,22 +223,35 @@ function M.open_floating_terminal(cmd, title, close_term, opts)
           pcall(opts.on_exit, code, { win = win, buf = buf, cmd = cmd, title = title })
         end
 
-        if (code == 0 and close_term) then
+        -- 追加结果提示行，绑定 q 手动关闭（仅构建成功时终端仍可见）
+        if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_win_is_valid(win) then
+          vim.bo[buf].modifiable = true
+          local msg = code == 0
+            and "  [Build succeeded — press q to close]"
+            or  "  [Build failed — press q to close]"
+          vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "", msg })
+          vim.bo[buf].modifiable = false
+          user_scrolled = false
+          scroll_to_bottom()
+        end
+
+        vim.keymap.set("n", "q", function()
           if vim.api.nvim_win_is_valid(win) then
             vim.api.nvim_win_close(win, true)
           end
-        end
+        end, { buffer = buf, nowait = true, desc = "关闭 Conan 构建终端" })
       end)
     end,
-    on_stdout = function()
-      vim.schedule(scroll_to_bottom)
-    end,
-    on_stderr = function()
-      vim.schedule(scroll_to_bottom)
-    end,
+    on_stdout = function() vim.schedule(scroll_to_bottom) end,
+    on_stderr = function() vim.schedule(scroll_to_bottom) end,
   })
 
   vim.bo[buf].modifiable = false
+
+  -- termopen 完成后归还焦点（termopen 必须在目标窗口激活时调用）
+  if vim.api.nvim_win_is_valid(origin_win) then
+    vim.api.nvim_set_current_win(origin_win)
+  end
 end
 
 function M.get_conan_remotes_from_cli()
